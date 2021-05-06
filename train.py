@@ -20,6 +20,7 @@ from torch.cuda import amp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+from pathlib import Path
 
 import test  # import test.py to get mAP after each epoch
 from models.experimental import attempt_load
@@ -35,6 +36,17 @@ from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, is_parallel
 from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
 
+#################
+# Azure ML Logger
+#################
+
+from azureml.core import Dataset, Run
+
+run = Run.get_context()
+ws = run.experiment.workspace
+
+#################
+
 logger = logging.getLogger(__name__)
 
 
@@ -43,11 +55,14 @@ def train(hyp, opt, device, tb_writer=None):
     save_dir, epochs, batch_size, total_batch_size, weights, rank = \
         Path(opt.save_dir), opt.epochs, opt.batch_size, opt.total_batch_size, opt.weights, opt.global_rank
 
+    best_pt = Path(os.getcwd()).name + "_best.pt"
+    last_pt = Path(os.getcwd()).name + "_last.pt"
+    
     # Directories
     wdir = save_dir / 'weights'
     wdir.mkdir(parents=True, exist_ok=True)  # make dir
-    last = wdir / 'last.pt'
-    best = wdir / 'best.pt'
+    last = wdir / last_pt
+    best = wdir / best_pt
     results_file = save_dir / 'results.txt'
 
     # Save run settings
@@ -99,7 +114,10 @@ def train(hyp, opt, device, tb_writer=None):
     test_path = data_dict['val']
 
     # Freeze
-    freeze = []  # parameter names to freeze (full or partial)
+    if opt.transfer_learning:
+        freeze = ['model.%s.' % x for x in range(13)]
+    else:
+        freeze = []
     for k, v in model.named_parameters():
         v.requires_grad = True  # train all layers
         if any(x in k for x in freeze):
@@ -321,6 +339,7 @@ def train(hyp, opt, device, tb_writer=None):
             # Print
             if rank in [-1, 0]:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
+                run.log('mean_train_loss', np.float(mloss[3]))
                 mem = '%.3gG' % (torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0)  # (GB)
                 s = ('%10s' * 2 + '%10.4g' * 6) % (
                     '%g/%g' % (epoch, epochs - 1), mem, *mloss, targets.shape[0], imgs.shape[-1])
@@ -363,6 +382,9 @@ def train(hyp, opt, device, tb_writer=None):
                                                  wandb_logger=wandb_logger,
                                                  compute_loss=compute_loss,
                                                  is_coco=is_coco)
+                run.log('precision', results[0])
+                run.log('recall', results[1])
+                run.log('mAP@.5-.95', results[3])
 
             # Write
             with open(results_file, 'a') as f:
@@ -457,7 +479,9 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', type=str, default='yolov3.pt', help='initial weights path')
     parser.add_argument('--cfg', type=str, default='', help='model.yaml path')
-    parser.add_argument('--data', type=str, default='data/coco128.yaml', help='data.yaml path')
+    parser.add_argument('--yolo-data-dir', type=str, help='path to YOLO data')
+    parser.add_argument('--num_classes', type=int, help='number of classes to train the model on')
+    parser.add_argument('--class_labels', nargs='*', help='Labels of classes to train on')
     parser.add_argument('--hyp', type=str, default='data/hyp.scratch.yaml', help='hyperparameters path')
     parser.add_argument('--epochs', type=int, default=300)
     parser.add_argument('--batch-size', type=int, default=16, help='total batch size for all GPUs')
@@ -481,6 +505,7 @@ if __name__ == '__main__':
     parser.add_argument('--project', default='runs/train', help='save to project/name')
     parser.add_argument('--entity', default=None, help='W&B entity')
     parser.add_argument('--name', default='exp', help='save to project/name')
+    parser.add_argument('--transfer-learning', action='store_true', help='freeze backbone network and use custom weights')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--quad', action='store_true', help='quad dataloader')
     parser.add_argument('--linear-lr', action='store_true', help='linear LR')
@@ -498,6 +523,29 @@ if __name__ == '__main__':
     if opt.global_rank in [-1, 0]:
         check_git_status()
         check_requirements()
+
+    # Retrieve Azure dataset in training script
+    data_folder = opt.yolo_data_dir
+    
+    train_path = data_folder + '/images/train/'
+    valid_path = data_folder + '/images/valid/'
+
+    ###########################
+    # Create suitable YAML file
+    ###########################
+
+    data_config = dict(
+        train = train_path,
+        val = valid_path,
+        nc = opt.num_classes,
+        names = opt.class_labels
+    )
+    
+    with open('./data/data.yaml', 'w') as datafile:
+        yaml.dump(data_config, datafile, default_flow_style=True)
+        opt.data = './data/data.yaml'
+
+    ############################
 
     # Resume
     wandb_run = check_wandb_resume(opt)
