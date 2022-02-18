@@ -56,8 +56,8 @@ from utils.torch_utils import EarlyStopping, ModelEMA, de_parallel, select_devic
 
 from azureml.core import Dataset, Run
 
-run = Run.get_context()
-ws = run.experiment.workspace
+azml_run = Run.get_context()
+ws = azml_run.experiment.workspace
 
 #################
 
@@ -78,7 +78,11 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
     # Directories
     w = save_dir / 'weights'  # weights dir
     (w.parent if evolve else w).mkdir(parents=True, exist_ok=True)  # make dir
-    last, best = w / 'last.pt', w / 'best.pt'
+
+    best_pt = Path(os.getcwd()).name + "_best.pt"
+    last_pt = Path(os.getcwd()).name + "_last.pt"
+
+    last, best = w / last_pt, w / best_pt
 
     # Hyperparameters
     if isinstance(hyp, str):
@@ -348,6 +352,12 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
             # Log
             if RANK in [-1, 0]:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
+                
+                #AZML Mean Train Loss logging
+                azml_run.log('train_box_loss', np.float(mloss[0]))
+                azml_run.log('train_obj_loss', np.float(mloss[1]))
+                azml_run.log('train_cls_loss', np.float(mloss[2]))
+
                 mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
                 pbar.set_description(('%10s' * 2 + '%10.4g' * 5) % (
                     f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
@@ -374,6 +384,11 @@ def train(hyp,  # path/to/hyp.yaml or hyp dictionary
                                            plots=False,
                                            callbacks=callbacks,
                                            compute_loss=compute_loss)
+
+                # AZML Logging for Precision, Recall and mAP@.5-.95
+                azml_run.log('precision', results[0])
+                azml_run.log('recall', results[1])
+                azml_run.log('mAP@.5-.95', results[3])
 
             # Update best mAP
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
@@ -455,7 +470,7 @@ def parse_opt(known=False):
     parser.add_argument('--yolo-data-dir', type=str, help='path to YOLO data')
     parser.add_argument('--num_classes', type=int, help='number of classes to train the model on')
     parser.add_argument('--class_labels', nargs='*', help='Labels of classes to train on')
-    parser.add_argument('--hyp', type=str, default='data/hyp.scratch.yaml', help='hyperparameters path')
+    parser.add_argument('--hyp', type=str, default='data/hyps/hyp.scratch.yaml', help='hyperparameters path')
     parser.add_argument('--epochs', type=int, default=300)
     parser.add_argument('--batch-size', type=int, default=16, help='total batch size for all GPUs, -1 for autobatch')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=640, help='train, val image size (pixels)')
